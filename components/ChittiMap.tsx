@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState, useEffect, useCallback } from "react";
+import { useMemo, useState, useEffect, useRef, useCallback } from "react";
 import {
   MapContainer,
   TileLayer,
@@ -8,6 +8,7 @@ import {
   Popup,
   Polyline,
   ZoomControl,
+  useMap,
 } from "react-leaflet";
 import L from "leaflet";
 import { supabase } from "@/lib/superbase";
@@ -22,18 +23,12 @@ export type PotholeSpot = {
   status: "active" | "verification";
 };
 
+export type VehicleMode = "car" | "bike";
+export type NavState = "idle" | "playing" | "paused";
+
 const CHENNAI_CENTER: [number, number] = [13.0827, 80.2707];
 
-// Navigation route — only shown when user explicitly requests routing
-const DEFAULT_ROUTE: [number, number][] = [
-  [13.0993, 80.2209],
-  [13.085, 80.2101],
-  [13.0604, 80.2205],
-  [13.0418, 80.2341],
-  [13.0189, 80.2432],
-  [13.0012, 80.2565],
-];
-
+// ── Pothole icon helpers ───────────────────────────────────────────────────
 function severityFill(severity: PotholeSpot["severity"]) {
   switch (severity) {
     case "High":   return "#FF5A5F";
@@ -91,32 +86,244 @@ function buildUserIcon() {
   });
 }
 
-export default function ChittiMap({ potholes = [] }: { potholes?: PotholeSpot[] }) {
+// ── Vehicle icons (car / bike) with bearing rotation ──────────────────────
+function buildCarIcon(bearing: number) {
+  return L.divIcon({
+    className: "",
+    html: `
+      <div style="width:40px;height:40px;display:flex;align-items:center;justify-content:center;transform:rotate(${bearing}deg);filter:drop-shadow(0 4px 10px rgba(0,0,0,0.6));">
+        <svg viewBox="0 0 40 40" width="40" height="40" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <!-- Body -->
+          <rect x="8" y="14" width="24" height="16" rx="4" fill="#3B7BF6" stroke="#fff" stroke-width="1.5"/>
+          <!-- Roof -->
+          <rect x="11" y="8" width="18" height="10" rx="3" fill="#6CA0FF" stroke="#fff" stroke-width="1.2"/>
+          <!-- Windshield -->
+          <rect x="12" y="9" width="16" height="7" rx="2" fill="#050B18" fill-opacity="0.7"/>
+          <!-- Wheels -->
+          <circle cx="12" cy="30" r="4" fill="#050B18" stroke="#fff" stroke-width="1.5"/>
+          <circle cx="28" cy="30" r="4" fill="#050B18" stroke="#fff" stroke-width="1.5"/>
+          <!-- Front indicator -->
+          <circle cx="20" cy="7" r="2" fill="#FBBF24"/>
+        </svg>
+      </div>
+    `,
+    iconSize: [40, 40],
+    iconAnchor: [20, 20],
+  });
+}
+
+function buildBikeIcon(bearing: number) {
+  return L.divIcon({
+    className: "",
+    html: `
+      <div style="width:40px;height:40px;display:flex;align-items:center;justify-content:center;transform:rotate(${bearing}deg);filter:drop-shadow(0 4px 10px rgba(0,0,0,0.6));">
+        <svg viewBox="0 0 40 40" width="40" height="40" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <!-- Wheels -->
+          <circle cx="10" cy="30" r="6" fill="none" stroke="#35D1E0" stroke-width="2.5"/>
+          <circle cx="30" cy="30" r="6" fill="none" stroke="#35D1E0" stroke-width="2.5"/>
+          <!-- Hub dots -->
+          <circle cx="10" cy="30" r="2" fill="#35D1E0"/>
+          <circle cx="30" cy="30" r="2" fill="#35D1E0"/>
+          <!-- Frame -->
+          <polyline points="10,30 20,18 30,30" stroke="#35D1E0" stroke-width="2.5" stroke-linejoin="round"/>
+          <line x1="20" y1="18" x2="20" y2="10" stroke="#35D1E0" stroke-width="2" stroke-linecap="round"/>
+          <!-- Handlebar -->
+          <line x1="16" y1="11" x2="24" y2="11" stroke="#35D1E0" stroke-width="2.5" stroke-linecap="round"/>
+          <!-- Rider dot -->
+          <circle cx="20" cy="8" r="3" fill="#35D1E0" stroke="#fff" stroke-width="1"/>
+          <!-- Front indicator -->
+          <circle cx="20" cy="5" r="1.5" fill="#FBBF24"/>
+        </svg>
+      </div>
+    `,
+    iconSize: [40, 40],
+    iconAnchor: [20, 20],
+  });
+}
+
+// ── Bearing calculation ────────────────────────────────────────────────────
+function calcBearing(from: [number, number], to: [number, number]): number {
+  const dLat = to[0] - from[0];
+  const dLng = to[1] - from[1];
+  const rad = Math.atan2(dLng, dLat);
+  return (rad * 180) / Math.PI;
+}
+
+// ── Lerp between two route points ─────────────────────────────────────────
+function interpolate(
+  a: [number, number],
+  b: [number, number],
+  t: number
+): [number, number] {
+  return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+}
+
+// ── Sub-component to recenter map when route changes ──────────────────────
+function MapFlyTo({ polyline }: { polyline: [number, number][] | null }) {
+  const map = useMap();
+  useEffect(() => {
+    if (!polyline || polyline.length < 2) return;
+    const bounds = L.latLngBounds(polyline.map((p) => L.latLng(p[0], p[1])));
+    map.fitBounds(bounds, { padding: [60, 60], animate: true });
+  }, [map, polyline]);
+  return null;
+}
+
+// ── Props ─────────────────────────────────────────────────────────────────
+interface ChittiMapProps {
+  potholes?: PotholeSpot[];
+  routePolyline?: [number, number][] | null;
+  vehicleMode?: VehicleMode;
+  navState?: NavState;
+  onNavStateChange?: (state: NavState) => void;
+}
+
+// ── Main component ────────────────────────────────────────────────────────
+export default function ChittiMap({
+  potholes = [],
+  routePolyline = null,
+  vehicleMode = "car",
+  navState = "idle",
+  onNavStateChange,
+}: ChittiMapProps) {
   const [activePotholes, setActivePotholes] = useState<PotholeSpot[]>(potholes);
   const [currentPos, setCurrentPos] = useState<[number, number]>(CHENNAI_CENTER);
   const [isReportModalOpen, setIsReportModalOpen] = useState(false);
 
-  // Fetch real GPS position once on mount; fall back to Chennai centre
-  useEffect(() => {
-    if (!("geolocation" in navigator)) return;
+  // Vehicle animation state
+  const [vehiclePos, setVehiclePos] = useState<[number, number] | null>(null);
+  const [vehicleBearing, setVehicleBearing] = useState(0);
 
-    const watchId = navigator.geolocation.watchPosition(
-      (pos) => {
-        setCurrentPos([pos.coords.latitude, pos.coords.longitude]);
-      },
-      () => {
-        // GPS unavailable — keep Chennai centre default
-        setCurrentPos(CHENNAI_CENTER);
-      },
-      { enableHighAccuracy: true, timeout: 8000 }
-    );
+  // Animation internals (stable refs — no re-render)
+  const animFrameRef = useRef<number | null>(null);
+  const segIndexRef = useRef(0);     // current polyline segment index
+  const segProgressRef = useRef(0);  // 0..1 progress within current segment
+  const lastTimeRef = useRef<number | null>(null);
+
+  // Speed: metres of route covered per millisecond (~40 km/h ≈ 0.011 m/ms)
+  const SPEED_M_PER_MS = 0.011;
+
+  // Approximate distance between two [lat,lng] pairs in metres (haversine approx)
+  const segLengthMetres = useCallback(
+    (a: [number, number], b: [number, number]) => {
+      const R = 6371000;
+      const dLat = ((b[0] - a[0]) * Math.PI) / 180;
+      const dLng = ((b[1] - a[1]) * Math.PI) / 180;
+      const sinDlat = Math.sin(dLat / 2);
+      const sinDlng = Math.sin(dLng / 2);
+      return (
+        2 *
+        R *
+        Math.asin(
+          Math.sqrt(
+            sinDlat * sinDlat +
+              Math.cos((a[0] * Math.PI) / 180) *
+                Math.cos((b[0] * Math.PI) / 180) *
+                sinDlng * sinDlng
+          )
+        )
+      );
+    },
+    []
+  );
+
+  // ── Animation loop ────────────────────────────────────────────────────────
+  const animate = useCallback(
+    (timestamp: number) => {
+      if (!routePolyline || routePolyline.length < 2) return;
+
+      const delta = lastTimeRef.current == null ? 0 : timestamp - lastTimeRef.current;
+      lastTimeRef.current = timestamp;
+
+      let distRemaining = SPEED_M_PER_MS * delta;
+
+      while (distRemaining > 0 && segIndexRef.current < routePolyline.length - 1) {
+        const segA = routePolyline[segIndexRef.current];
+        const segB = routePolyline[segIndexRef.current + 1];
+        const segLen = segLengthMetres(segA, segB);
+
+        const distToEnd = segLen * (1 - segProgressRef.current);
+
+        if (distRemaining >= distToEnd) {
+          // Move to next segment
+          distRemaining -= distToEnd;
+          segIndexRef.current += 1;
+          segProgressRef.current = 0;
+        } else {
+          segProgressRef.current += distRemaining / segLen;
+          distRemaining = 0;
+        }
+      }
+
+      if (segIndexRef.current >= routePolyline.length - 1) {
+        // Reached destination
+        setVehiclePos(routePolyline[routePolyline.length - 1]);
+        onNavStateChange?.("idle");
+        return;
+      }
+
+      const segA = routePolyline[segIndexRef.current];
+      const segB = routePolyline[segIndexRef.current + 1];
+      const pos = interpolate(segA, segB, segProgressRef.current);
+      const bearing = calcBearing(segA, segB);
+
+      setVehiclePos(pos);
+      setVehicleBearing(bearing);
+
+      animFrameRef.current = requestAnimationFrame(animate);
+    },
+    [routePolyline, segLengthMetres, onNavStateChange]
+  );
+
+  // ── Control animation based on navState ───────────────────────────────────
+  useEffect(() => {
+    if (navState === "playing") {
+      lastTimeRef.current = null;
+      animFrameRef.current = requestAnimationFrame(animate);
+    } else {
+      if (animFrameRef.current != null) {
+        cancelAnimationFrame(animFrameRef.current);
+        animFrameRef.current = null;
+      }
+    }
 
     return () => {
-      navigator.geolocation.clearWatch(watchId);
+      if (animFrameRef.current != null) {
+        cancelAnimationFrame(animFrameRef.current);
+        animFrameRef.current = null;
+      }
     };
+  }, [navState, animate]);
+
+  // Reset vehicle when route changes
+  useEffect(() => {
+    segIndexRef.current = 0;
+    segProgressRef.current = 0;
+    lastTimeRef.current = null;
+    if (routePolyline && routePolyline.length > 0) {
+      setVehiclePos(routePolyline[0]);
+      setVehicleBearing(
+        routePolyline.length > 1
+          ? calcBearing(routePolyline[0], routePolyline[1])
+          : 0
+      );
+    } else {
+      setVehiclePos(null);
+    }
+  }, [routePolyline]);
+
+  // ── GPS ───────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!(typeof window !== "undefined" && "geolocation" in navigator)) return;
+    const watchId = navigator.geolocation.watchPosition(
+      (pos) => setCurrentPos([pos.coords.latitude, pos.coords.longitude]),
+      () => setCurrentPos(CHENNAI_CENTER),
+      { enableHighAccuracy: true, timeout: 8000 }
+    );
+    return () => navigator.geolocation.clearWatch(watchId);
   }, []);
 
-  // Fetch pothole contributions from Supabase (memoised callback to avoid stale closure)
+  // ── Supabase pothole feed ─────────────────────────────────────────────────
   const fetchContributions = useCallback(async () => {
     const { data, error } = await supabase.from("contributions").select("*");
     if (!error && data) {
@@ -126,9 +333,7 @@ export default function ChittiMap({ potholes = [] }: { potholes?: PotholeSpot[] 
           const parts = item.location.split(",");
           const parsedLat = parseFloat(parts[0]);
           const parsedLng = parseFloat(parts[1]);
-          if (!isNaN(parsedLat) && !isNaN(parsedLng)) {
-            coords = [parsedLat, parsedLng];
-          }
+          if (!isNaN(parsedLat) && !isNaN(parsedLng)) coords = [parsedLat, parsedLng];
         }
         return {
           id: item.id,
@@ -145,19 +350,16 @@ export default function ChittiMap({ potholes = [] }: { potholes?: PotholeSpot[] 
 
   useEffect(() => {
     fetchContributions();
-
     const channel = supabase
       .channel("map-realtime-contributions")
       .on("postgres_changes", { event: "*", schema: "public", table: "contributions" }, () => {
         fetchContributions();
       })
       .subscribe();
-
-    return () => {
-      supabase.removeChannel(channel);
-    };
+    return () => { supabase.removeChannel(channel); };
   }, [fetchContributions]);
 
+  // ── Memoised icons ────────────────────────────────────────────────────────
   const potholeIcons = useMemo(
     () => ({
       High: buildPotholeIcon("High"),
@@ -166,9 +368,17 @@ export default function ChittiMap({ potholes = [] }: { potholes?: PotholeSpot[] 
     }),
     []
   );
-
   const verificationIcon = useMemo(() => buildVerificationIcon(), []);
   const userIcon = useMemo(() => buildUserIcon(), []);
+
+  // Vehicle icon must be recreated when bearing or mode changes
+  const vehicleIcon = useMemo(
+    () =>
+      vehicleMode === "car"
+        ? buildCarIcon(vehicleBearing)
+        : buildBikeIcon(vehicleBearing),
+    [vehicleMode, vehicleBearing]
+  );
 
   return (
     <div className="relative h-full w-full">
@@ -179,17 +389,42 @@ export default function ChittiMap({ potholes = [] }: { potholes?: PotholeSpot[] 
         />
         <ZoomControl position="bottomright" />
 
-        {/* Live user GPS marker */}
+        {/* Auto-fit map to route */}
+        <MapFlyTo polyline={routePolyline ?? null} />
+
+        {/* GPS marker */}
         <Marker position={currentPos} icon={userIcon}>
           <Popup>
             <p className="font-bold text-xs text-blue-600">Your Current Location 📍</p>
           </Popup>
         </Marker>
 
-        {/* Route polyline — visible but not auto-animating. Only rendered when a route is set. */}
-        <Polyline positions={DEFAULT_ROUTE} pathOptions={{ color: "#3B7BF6", weight: 6, opacity: 0.7, lineCap: "round" }} />
-        <Polyline positions={DEFAULT_ROUTE} pathOptions={{ color: "#35D1E0", weight: 2, opacity: 0.8, dashArray: "1, 8" }} />
+        {/* OSRM route polyline — only shown when route is loaded */}
+        {routePolyline && routePolyline.length > 1 && (
+          <>
+            <Polyline
+              positions={routePolyline}
+              pathOptions={{ color: "#3B7BF6", weight: 6, opacity: 0.75, lineCap: "round" }}
+            />
+            <Polyline
+              positions={routePolyline}
+              pathOptions={{ color: "#35D1E0", weight: 2, opacity: 0.85, dashArray: "1, 8" }}
+            />
+          </>
+        )}
 
+        {/* Animated vehicle */}
+        {vehiclePos && (
+          <Marker position={vehiclePos} icon={vehicleIcon} zIndexOffset={1000}>
+            <Popup>
+              <p className="font-bold text-xs text-blue-600">
+                {vehicleMode === "car" ? "🚗 Your Car" : "🏍️ Your Bike"}
+              </p>
+            </Popup>
+          </Marker>
+        )}
+
+        {/* Pothole markers */}
         {activePotholes.map((spot) => (
           <Marker
             key={spot.id}
